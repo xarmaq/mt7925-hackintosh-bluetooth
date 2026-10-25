@@ -844,9 +844,11 @@ void MtkBt::wakeNow() {
         return;
     wakes++;
     setProperty("MtkBtWakes", wakes, 32);
-    retain();   // released by the worker
+    retain();   // both released by the worker; the provider may be terminated while it waits
+    intf->retain();
     thread_t th = nullptr;
     if (kernel_thread_start(&MtkBt::wakeWorker, this, &th) != KERN_SUCCESS) {
+        intf->release();
         release();
         fail("wake: worker thread failed");
         return;
@@ -856,15 +858,17 @@ void MtkBt::wakeNow() {
 
 void MtkBt::wakeWorker(void *arg, wait_result_t) {
     MtkBt *me = static_cast<MtkBt *>(arg);
+    IOUSBHostInterface *held = me->intf;
     for (uint32_t t = 0; t < kWakeDelayMs && !me->stopping; t += 100)
         IOSleep(100);
-    if (!me->stopping && !me->intf->isInactive()) {
+    if (!me->stopping && !held->isInactive()) {
         me->loglen = 0;   // MtkBtLog keeps its first 1.5 KB: start it again for this wake
         me->bytesSent = me->blocksSent = 0;
         me->intrPackets = 0;
         me->say("wake %u: running the attach sequence again", me->wakes);
         me->run(true);
     }
+    held->release();
     me->release();
 }
 

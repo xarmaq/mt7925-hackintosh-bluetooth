@@ -55,6 +55,15 @@
 // That alone did not rule out a loop: on some boards the chip itself may drop off the bus during the reset, so 0.2.4
 // also caps resets at kMaxResetsPerBoot across all instances.
 //
+// Sleep and wake (stealth-a16 fork). Same IOPMrootDomain priority interest: at kIOMessageSystemWillSleep the
+// function goes off with FUNC_CTRL 0 as at power off (best effort; skipped when bluetoothd holds the interface), and
+// at kIOMessageSystemHasPoweredOn a worker waits kWakeDelayMs for the USB stack and then runs the attach sequence
+// again. A chip that kept power answers "already loaded" for every section (or only HCI, see the warm-reboot probe)
+// and gets FUNC_CTRL 1; a chip that lost power gets the whole download. When the device re-enumerates on wake
+// instead, this instance is terminated (stop skips FUNC_CTRL 0 on the inactive provider) and a fresh MtkBt loads the
+// firmware as at boot. Each sleep refreshes the per-boot reset budget. MtkBtSleep = false in Info.plist or boot-arg
+// -mtknosleep go back to acknowledging sleep only.
+//
 // Every wait has a deadline, every failure ends in MtkBtState = "error" with the interface closed. Nothing panics.
 // Result: ioreg -rc MtkBt -l | grep MtkBt
 
@@ -63,6 +72,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
+#include <pexpert/pexpert.h>
 // IOUSBHostInterface/IOUSBHostPipe are marked "Use USBDriverKit" in the SDK; they are still the KPI the 15.x kernel
 // exports, and a dext cannot run before the kernel collection loads, so the deprecation is silenced here only.
 #pragma clang diagnostic push
@@ -118,6 +128,7 @@ constexpr uint32_t kOffOpenTimeoutMs = 1000;    // FUNC_CTRL 0: bluetoothd has l
 constexpr uint32_t kOffLockWaitMs = 5000;       // FUNC_CTRL 0: how long to wait for a worker that is still loading
 constexpr uint32_t kMaxResets = 2;              // subsystem resets (each followed by a full download) per start
 constexpr uint32_t kMaxResetsPerBoot = 2;       // the same, across every MtkBt instance since the kext loaded
+constexpr uint32_t kWakeDelayMs = 2000;         // after wake: time for the USB stack to resume or re-enumerate the device
 
 // Shared by all instances for the life of the kext (one boot). If a subsystem reset makes the chip drop off the
 // bus, it re-enumerates, a fresh MtkBt starts and would reset it again: a loop that kept the whole USB controller
@@ -156,6 +167,10 @@ private:
     volatile bool stopping = false, intrStop = false, intrBusy = false, opened = false;
     volatile bool offPath = false;     // the FUNC_CTRL 0 session runs although stopping is set
     bool chipSeen = false, offDone = false;
+    // sleep / wake: terminating survives a wake (stopping is cleared then), sleeping spans WillSleep .. HasPoweredOn
+    volatile bool terminating = false, sleeping = false;
+    bool sleepOn = true;
+    uint32_t sleeps = 0, wakes = 0;
     volatile uint32_t intrPackets = 0;
     // last HCI Command Complete seen on the interrupt endpoint (for the warm-reboot HCI probe)
     volatile uint16_t lastCcOpcode = 0;
@@ -166,8 +181,11 @@ private:
     uint32_t bytesSent = 0, blocksSent = 0, sectionsSent = 0, sectionsSkipped = 0;
 
     static void worker(void *arg, wait_result_t);
-    void run();
+    static void wakeWorker(void *arg, wait_result_t);
+    void run(bool wake = false);
     bool setup();
+    void sleepNow();
+    void wakeNow();
     void vsay(bool error, const char *fmt, va_list ap);
     void say(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     void fail(const char *fmt, ...) __attribute__((format(printf, 2, 3)));   // say + MtkBtLastError
@@ -783,25 +801,89 @@ void MtkBt::funcOff(const char *why) {
 
 // IOPMrootDomain priority interest. For a halt or restart, handlePlatformHaltRestart delivers
 // kIOMessageSystemWillPowerOff / kIOMessageSystemWillRestart to these clients (platformHaltRestartApplier) before
-// the power-tree shutdown, so the USB stack still runs. Sleep messages are acknowledged at once (no sleep support).
+// the power-tree shutdown, so the USB stack still runs. kIOMessageSystemWillSleep also comes to priority clients
+// before the power tree goes down (the USB device is still up), kIOMessageSystemHasPoweredOn after it is up again;
+// the handler returns at once for both (returnValue stays 0, no extra time asked for).
 IOReturn MtkBt::pmHandler(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
     MtkBt *me = static_cast<MtkBt *>(target);
     if (me && (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart)) {
         me->stopping = true;
         me->funcOff(type == kIOMessageSystemWillRestart ? "restart" : "power off");
+    } else if (me && type == kIOMessageSystemWillSleep) {
+        me->sleepNow();
+    } else if (me && type == kIOMessageSystemHasPoweredOn) {
+        me->wakeNow();
     }
     return kIOReturnSuccess;
 }
 
-void MtkBt::run() {
+// WillSleep: a worker that is still loading gives up (stopping), then FUNC_CTRL 0 as btmtk_usb_shutdown, best effort.
+// Nothing here keeps the system awake longer than funcOff's own deadlines (5 s for the lock, 1 s to open, 2 s per WMT).
+void MtkBt::sleepNow() {
+    if (!sleepOn || terminating || sleeping)
+        return;
+    sleeping = true;
+    stopping = true;
+    sleeps++;
+    setProperty("MtkBtSleeps", sleeps, 32);
+    gResetsThisBoot = 0;   // a fresh reset budget for the wake (a re-enumerated instance uses it too)
+    offDone = false;
+    funcOff("sleep");
+}
+
+// HasPoweredOn (also after a sleep that was cancelled after WillSleep): reload on a worker thread, as at attach, unless
+// this instance is on its way out (re-enumeration) or never saw an MT7925
+void MtkBt::wakeNow() {
+    if (!sleeping)
+        return;
+    sleeping = false;
+    if (terminating || !intf || intf->isInactive())
+        return;
+    stopping = false;
+    if (!chipSeen)
+        return;
+    wakes++;
+    setProperty("MtkBtWakes", wakes, 32);
+    retain();   // released by the worker
+    thread_t th = nullptr;
+    if (kernel_thread_start(&MtkBt::wakeWorker, this, &th) != KERN_SUCCESS) {
+        release();
+        fail("wake: worker thread failed");
+        return;
+    }
+    thread_deallocate(th);
+}
+
+void MtkBt::wakeWorker(void *arg, wait_result_t) {
+    MtkBt *me = static_cast<MtkBt *>(arg);
+    for (uint32_t t = 0; t < kWakeDelayMs && !me->stopping; t += 100)
+        IOSleep(100);
+    if (!me->stopping && !me->intf->isInactive()) {
+        me->loglen = 0;   // MtkBtLog keeps its first 1.5 KB: start it again for this wake
+        me->bytesSent = me->blocksSent = 0;
+        me->intrPackets = 0;
+        me->say("wake %u: running the attach sequence again", me->wakes);
+        me->run(true);
+    }
+    me->release();
+}
+
+void MtkBt::run(bool wake) {
     IOLockLock(lock);
     uint64_t t0 = nowMs();
     state("loading");
     step("open");
     if (stopping || !beginSession(kOpenTimeoutMs)) {
-        if (!stopping)
-            fail("interface busy (open failed)");
-        state(stopping ? "stopped" : "error");
+        if (!stopping && wake) {
+            // bluetoothd kept the interface open across the sleep: the chip kept power and its firmware, or the
+            // controller is gone for bluetoothd too; either way there is nothing this kext can do without the interface
+            say("wake: interface held by another client, nothing reloaded");
+            state("held");
+        } else {
+            if (!stopping)
+                fail("interface busy (open failed)");
+            state(stopping ? "stopped" : "error");
+        }
         IOLockUnlock(lock);
         return;
     }
@@ -838,11 +920,18 @@ bool MtkBt::start(IOService *provider) {
     lock = IOLockAlloc();
     if (!cmd || !ev || !lock)
         return false;
-    setProperty("MtkBtVersion", "0.2.4");
+    setProperty("MtkBtVersion", "0.2.4-stealth.1");
     setProperty("MtkBtFirmware", mtk_bt_fw_name);
     setProperty("MtkBtFirmwareSha256", mtk_bt_fw_sha256);
     setProperty("MtkBtFirmwareBytes", mtk_bt_fw_len, 32);
     setProperty("MtkBtTries", 0ull, 32);
+    // sleep / wake (default on): MtkBtSleep false or boot-arg -mtknosleep go back to acknowledging sleep only
+    if (OSBoolean *slp = OSDynamicCast(OSBoolean, getProperty("MtkBtSleep")))
+        sleepOn = slp->isTrue();
+    uint32_t noSleep = 0;
+    if (PE_parse_boot_argn("-mtknosleep", &noSleep, sizeof(noSleep)))
+        sleepOn = false;
+    setProperty("MtkBtSleep", sleepOn);
     state("starting");
     pmNotifier = registerPrioritySleepWakeInterest(&MtkBt::pmHandler, this, nullptr);
     if (!pmNotifier)
@@ -862,12 +951,14 @@ bool MtkBt::start(IOService *provider) {
 
 bool MtkBt::willTerminate(IOService *provider, IOOptionBits options) {
     // the worker sees this between steps; every control transfer is aborted by close() in run()
+    terminating = true;
     stopping = true;
     intrStop = true;
     return IOService::willTerminate(provider, options);
 }
 
 void MtkBt::stop(IOService *provider) {
+    terminating = true;
     stopping = true;
     intrStop = true;
     if (pmNotifier) {

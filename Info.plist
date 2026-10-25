@@ -15,7 +15,7 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.4</string>
+	<string>0.2.4-stealth.1</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>CFBundleVersion</key>
@@ -28,6 +28,8 @@
 			<string>org.watchthelight.MtkBt</string>
 			<key>IOClass</key>
 			<string>MtkBt</string>
+			<key>MtkBtSleep</key>
+			<true/>
 			<key>IOProviderClass</key>
 			<string>IOUSBHostInterface</string>
 			<key>bConfigurationValue</key>
@@ -61,6 +63,8 @@
 			<string>org.watchthelight.MtkBt</string>
 			<key>IOClass</key>
 			<string>MtkBt</string>
+			<key>MtkBtSleep</key>
+			<true/>
 			<key>IOProviderClass</key>
 			<string>IOUSBHostInterface</string>
 			<key>bConfigurationValue</key>
@@ -83,6 +87,8 @@
 			<string>org.watchthelight.MtkBt</string>
 			<key>IOClass</key>
 			<string>MtkBt</string>
+			<key>MtkBtSleep</key>
+			<true/>
 			<key>IOProviderClass</key>
 			<string>IOUSBHostInterface</string>
 			<key>bConfigurationValue</key>

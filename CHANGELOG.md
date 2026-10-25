@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.4-stealth.1 (fork `xarmaq/mt7925-hackintosh-bluetooth`, branch `stealth-a16`, 2026-10-25)
+
+- Sleep and wake: FUNC_CTRL 0 at `kIOMessageSystemWillSleep` (reusing the power-off path, best effort), the attach
+  sequence again at `kIOMessageSystemHasPoweredOn` after 2 s when the device stayed attached; a device that
+  re-enumerates gets a fresh instance as at boot. Each sleep refreshes the per-boot subsystem reset budget.
+- `MtkBtSleep` (Info.plist, default true) and the boot-arg `-mtknosleep` turn it off. New properties `MtkBtSleep`,
+  `MtkBtSleeps`, `MtkBtWakes`; `MtkBtState` can read `held`.
+- CI: `.github/workflows/stealth.yml` builds with `tools/build-mac.sh` and publishes stealth tags as releases.
+- Not tested on hardware yet (written for the MSI Stealth A16 AI+, `0489:E14F`, which 0.2.2 already matches).
+
 ## 0.2.4 (2026-10-22)
 
 - Subsystem resets are now capped at 2 per boot across every MtkBt instance, not just per instance (#1). If a reset makes the chip drop off the USB bus, it comes back as a new device, a new MtkBt starts and 0.2.3 would reset it again, round after round. On the board in #1 that kept the USB controller busy enough to freeze the keyboard and mouse every few seconds, wired ones included. Once the budget is used up MtkBt gives up and says so in `MtkBtWarmPath`; a full power off clears the chip.

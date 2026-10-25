@@ -35,7 +35,7 @@ The MT7925 has two things `bluetoothd` on macOS 26.7.1 does not expect (an LE co
 - It only loads firmware. Everything after that (pairing, audio, LE) is Apple's `bluetoothd` with BlueToolFixup's patches, and whatever the MT7925 firmware does with it.
 - Only chip id 0x7925 is touched; anything else on that USB id is left alone.
 - The half-loaded recovery path (subsystem reset after a warm reboot that left the firmware running) is implemented from the Linux driver but has not been seen to trigger on this laptop since 0.2.0, so it is untested on real hardware.
-- No sleep and wake handling (the laptop this runs on has sleep disabled). At power off and restart it sends FUNC_CTRL 0 so the next boot starts clean.
+- Upstream has no sleep and wake handling (the laptop it was written on has sleep disabled). The `stealth-a16` fork adds it: FUNC_CTRL 0 before sleep (best effort), the attach sequence again after wake, or a fresh instance if the device re-enumerates. Not tested on hardware yet; `-mtknosleep` turns it off. At power off and restart it sends FUNC_CTRL 0 so the next boot starts clean.
 - Tested on one laptop and one firmware build.
 
 ## Which cards match
@@ -108,7 +108,8 @@ keys from the installation steps (`nvram -p | grep -i bluetooth` must list both)
 
 | Property | Meaning |
 |---|---|
-| `MtkBtState` | `starting`, `loading`, `ready`, `error`, `stopped`, `off` (FUNC_CTRL 0 sent) |
+| `MtkBtState` | `starting`, `loading`, `ready`, `error`, `stopped`, `off` (FUNC_CTRL 0 sent), `held` (fork: after wake the interface was held by another client, nothing reloaded) |
+| `MtkBtSleep`, `MtkBtSleeps`, `MtkBtWakes` | fork: sleep handling on or off (`MtkBtSleep` in Info.plist, boot-arg `-mtknosleep`), sleeps seen, wake reloads started |
 | `MtkBtTries` | download passes in this start (1 normally, up to 3 with the half-loaded recovery) |
 | `MtkBtLastError` | last error line; kept after a successful recovery, so it shows what triggered it |
 | `MtkBtStep` | last step entered: `open`, `chip id`, `slpprot bypass`, `download`, `hci probe`, `subsys reset`, `ep reset option`, `func ctrl`, `close`, `done` |
@@ -123,7 +124,7 @@ keys from the installation steps (`nvram -p | grep -i bluetooth` must list both)
 | `MtkBtFuncCtrlStatus` | status word of the FUNC_CTRL event |
 | `MtkBtWarmPath`, `MtkBtSubsysReset` | only set when the warm-reboot handling ran |
 | `MtkBtSlpProt` | sleep protection bypass: `bypass set`, `was already bypassed`, `read failed`, `write failed` |
-| `MtkBtFuncOff` | where FUNC_CTRL 0 was sent (`stop`, `restart`, `power off`) or `failed` |
+| `MtkBtFuncOff` | where FUNC_CTRL 0 was sent (`stop`, `restart`, `power off`, `sleep`) or `failed` |
 | `MtkBtIntrPackets` | HCI event packets read and dropped during setup |
 | `MtkBtElapsedMs` | time from open to close |
 

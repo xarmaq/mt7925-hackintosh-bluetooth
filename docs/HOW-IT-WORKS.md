@@ -34,6 +34,23 @@ macOS never turns the Bluetooth function off at shutdown (Linux does, in `btmtk_
 
 Since 0.2.0 the laptop this runs on has booted with `MtkBtTries` = 1 every time, so the reset path is implemented from the Linux driver but not yet exercised on hardware.
 
+## Sleep and wake (stealth-a16 fork)
+
+The same IOPMrootDomain priority interest also delivers `kIOMessageSystemWillSleep` (before the power tree goes down,
+so USB still works) and `kIOMessageSystemHasPoweredOn` (after it is up again). Unless `MtkBtSleep` is false or the
+boot-arg `-mtknosleep` is set:
+
+- Will sleep: a worker that is still loading gives up, the per-boot reset budget is refreshed for the wake, and WMT
+  FUNC_CTRL 0 goes out as at power off. While `bluetoothd` has the interface open this is skipped after 1 s
+  (`MtkBtFuncOff` stays as it was); the step never holds sleep up for more than its own deadlines.
+- Has powered on: if the USB device re-enumerated, this instance is terminated (FUNC_CTRL 0 skipped on the inactive
+  provider) and a new MtkBt runs the normal attach sequence. If it stayed attached, a worker waits 2 s for the USB stack
+  and runs the attach sequence again: a chip that kept power answers "already loaded" for every section (or only HCI)
+  and gets FUNC_CTRL 1; one that lost power gets the whole download. If the interface is held by another client after
+  wake, nothing is reloaded and `MtkBtState` = `held`.
+
+None of this has run on hardware yet.
+
 ## Failures and known risks
 
 Any failure ends with `MtkBtState` = `error`, the step name in `MtkBtStep`, the error line in `MtkBtLastError`, the whole trace in `MtkBtLog`, and the interface closed. There are no deliberate panics.
